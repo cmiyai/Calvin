@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 
+
 def xavier_truncated_normal_(x: torch.Tensor, in_features: int, out_features: int):
         '''
         Xavier normal initialization, distribution truncated to +-3 std
@@ -143,6 +144,155 @@ class RoPE(nn.Module):
         x_odd_rot = x_even * sin + x_odd * cos
         return torch.stack((x_even_rot, x_odd_rot), dim=-1).flatten(-2)
 
+class Multihead_Attention(nn.Module):
+    """
+    Implementation of Multi-head self-attention with causal masking from scratch
+    """
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            theta: float | None = None,
+            max_seq_len: int | None = None
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        
+        self.q_proj = Linear(d_model, d_model)
+        self.k_proj = Linear(d_model, d_model)
+        self.v_proj = Linear(d_model, d_model)
+        self.output_proj = Linear(d_model, d_model)
+        # apply RoPE
+        self.rope = RoPE(theta, self.d_k, max_seq_len) if theta is not None else None
+    
+    def forward(
+            self,
+            x: torch.Tensor, # our embedded input
+            tok_pos: torch.Tensor | None = None
+        ) -> torch.Tensor:
+        b, seq_len, _ = x.shape
+
+        # pass x into q, k, v
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.reshape(*q.shape[:-1], self.num_heads, self.d_k)  # (..., seq, heads, d_k)
+        q = q.transpose(-3, -2)      
+        k = k.reshape(*k.shape[:-1], self.num_heads, self.d_k)  # (..., seq, heads, d_k)
+        k = k.transpose(-3, -2)  
+        v = v.reshape(*v.shape[:-1], self.num_heads, self.d_k)  # (..., seq, heads, d_k)
+        v = v.transpose(-3, -2)                                     
+        
+        # Apply RoPE to key and query
+        if self.rope is not None:
+            q = self.rope(q, tok_pos)
+            k =self.rope(k, tok_pos)
+
+        # Lower-triangular causal mask: (seq_len, seq_len)
+        causal_mask = torch.tril(
+            torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool)
+        )
+
+        attn_scores = sdp_attention(q, k, v, mask=causal_mask)
+        attn_scores = attn_scores.transpose(1, 2).contiguous().view(b, seq_len, self.d_model)
+        return self.output_proj(attn_scores)
+
+class TransformerBlock(nn.Module):
+    """
+    Pre-LayerNorm Transformer Block using RMSNorm, RoPE Multi-Head Attention,
+    and a SwiGLU Feed-Forward Network
+    """
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            max_seq_len: int | None = None,
+            theta: float | None = None,
+            eps: float = 1e-5
+    ):
+        super().__init__()
+        # Prenorm
+        self.ln1 = RMSNorm(d_model=d_model, eps=eps)
+        self.ln2 = RMSNorm(d_model=d_model, eps=eps)
+
+        # multi-head self-attention
+        self.attn = Multihead_Attention(
+            d_model=d_model,
+            num_heads=num_heads,
+            theta=theta,
+            max_seq_len=max_seq_len,
+        )
+
+        # Apply SwiGLU Feed-forward sub-layer
+        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            tok_pos: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Forward Pass of the transformer block
+        y = x + MultiHeadSelfAttention(RMSNorm(x))
+        """
+        if tok_pos is None and self.attn.rope is not None:
+            seq_len = x.shape[1]
+            tok_pos = torch.arange(seq_len, device=x.device)
+        
+        h = x + self.attn(self.ln1(x), tok_pos=tok_pos)
+
+        # swiglu + apply residual connection
+        res_out = h + self.ffn(self.ln2(h))
+        return res_out
+
+class TransformerLM(nn.Module):
+    """
+    Transformer LM class
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                max_seq_len=context_length,
+                theta=rope_theta,
+            )
+            for _ in range(num_layers)
+        ])
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(
+        self,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # indices: (batch_size, sequence_length)
+        x = self.token_embeddings(indices)  # (b, seq_len, d_model)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.ln_final(x)
+        logits = self.lm_head(x)  # (b, seq_len, vocab_size)
+        return logits
 
 
 def softmax(x: torch.Tensor, dim_i: int):
@@ -153,3 +303,27 @@ def softmax(x: torch.Tensor, dim_i: int):
     norm_logits = torch.exp(x - max_vals)
     norm_sum = norm_logits.sum(dim=dim_i, keepdim=True)
     return norm_logits / norm_sum
+
+def sdp_attention(
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+    """
+    Running Scaled Dot Product Attention
+    softmax((QK^T)/sqrt(d_k))V
+    """
+    d_k = K.shape[-1]
+    # b: batch, q: query_seq_lens, k: key_seq_len, d: dims of q and k (dim_k)
+    qk_scaled = torch.einsum('...bqd, ...bkd-> ...bqk', Q, K) / math.sqrt(d_k)
+
+    # apply causal mask to prevent tokens from seeing future tokens
+    if mask is not None:
+        qk_scaled = qk_scaled.masked_fill(mask == 0, float('-inf'))
+
+    attn_weights = softmax(qk_scaled, -1)
+    
+    # v: vocab_len
+    attention = torch.einsum('...qk, ...kv -> ...qv', attn_weights, V)
+    return attention
