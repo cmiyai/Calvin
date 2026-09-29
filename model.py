@@ -22,13 +22,13 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         factory_kwargs = {'device': device, 'dtype': dtype}
-        self.weights = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.randn(out_features, in_features, **factory_kwargs)
         )
-        xavier_truncated_normal_(self.weights, self.in_features, self.out_features)
+        xavier_truncated_normal_(self.weight, self.in_features, self.out_features)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weights.T
+        return x @ self.weight.T
 
 class Embedding(nn.Module):
     '''
@@ -42,14 +42,14 @@ class Embedding(nn.Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         
         # our weight matrix has one row for every token in vocabulary
-        self.weights = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.randn(num_embeddings, embedding_dim, **factory_kwargs)
         )
         with torch.no_grad():
-            nn.init.trunc_normal_(self.weights, mean=0.0, std=1.0, a=-3.0, b=3.0)
+            nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
     
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.weights[token_ids]
+        return self.weight[token_ids]
 
 class RMSNorm(nn.Module):
     '''
@@ -102,6 +102,10 @@ class SwiGLU(nn.Module):
         gated = swish_w1_x * w3_x
 
         return self.w2(gated)
+
+def SiLU(in_features):
+    """SiLU activation function"""
+    return in_features * torch.sigmoid(in_features)
 
 class RoPE(nn.Module):
     '''
@@ -278,7 +282,7 @@ class TransformerLM(nn.Module):
             for _ in range(num_layers)
         ])
         self.ln_final = RMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head = Linear(d_model, vocab_size)
 
     def forward(
         self,
@@ -327,3 +331,4 @@ def sdp_attention(
     # v: vocab_len
     attention = torch.einsum('...qk, ...kv -> ...qv', attn_weights, V)
     return attention
+
