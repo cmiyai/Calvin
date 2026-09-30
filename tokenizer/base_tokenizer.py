@@ -1,76 +1,109 @@
-from abc import ABC, abstractmethod
-import json
-from pathlib import Path
+from typing import Iterable, Iterator
+import pickle
+import regex as re
 
-
-class BaseTokenizer(ABC):
-    """Abstract Base Class for implementing custom tokenizers."""
-
-    def __init__(self, special_tokens: list[str] | None = None):
-        self.special_tokens = special_tokens or []
-        
-        # Vocab mappings: ID -> Bytes and Bytes(BPE) or characters and subwords -> ID
-        self.vocab: dict[int, bytes] = {}
-        # optional merge
-
-    @abstractmethod
-    def train(self, input_text: str, vocab_size: int) -> None:
-        """Train the tokenizer vocabulary from raw text."""
-        pass
-
-    @abstractmethod
-    def encode(self, text: str) -> list[int]:
-        """Convert a text string into a list of integer token IDs."""
-        pass
-
-    @abstractmethod
-    def decode(self, ids: list[int]) -> str:
-        """Convert a list of integer token IDs back into a text string."""
-        pass
-
-
-    @property
-    def vocab_size(self) -> int:
-        """Returns the total number of items in the vocabulary."""
-        return len(self.vocab)
-
-    def save(self, filepath: str | Path) -> None:
-        """Serializes the tokenizer vocabulary and metadata to a JSON file."""
-        filepath = Path(filepath)
-        
-        # Safely encode bytes to Latin-1 strings for valid JSON
-        vocab_json = {
-            str(idx): token_bytes.decode("latin1") 
-            for idx, token_bytes in self.vocab.items()
-        }
-
-        data = {
-            "type": self.__class__.__name__,
-            "special_tokens": self.special_tokens,
-            "vocab": vocab_json,
-        }
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
+class Tokenizer():
+    def __init__(
+            self,
+            vocab: dict[int, bytes],
+            merges: list[tuple[bytes, bytes]],
+            special_tokens: list[str] | None = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.merge_rank = {pair: i for i, pair in enumerate(self.merges)}
+        self.special_tokens = special_tokens or [] # easier later for check if specialtoken inside
+        self.token_to_id = {tok: i for i, tok in self.vocab.items()} # gives us reverse hashing for token
+    
     @classmethod
-    def load(cls, filepath: str | Path) -> "BaseTokenizer":
-        """Loads a tokenizer instance from a saved JSON file."""
-        filepath = Path(filepath)
+    def from_files(
+            cls,
+            vocab_filepath: str,
+            merges_filepath: str, special_tokens=None):
+        """
+        Constructs and returns a Tokenizer instance from serialized vocabulary and merge files.
+        """
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
         
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # merges
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
+        return cls(vocab,merges, special_tokens)
 
-        instance = cls(special_tokens=data.get("special_tokens", []))
-        
-        # Restore vocabulary maps from Latin-1 strings back to raw bytes
-        instance.vocab = {
-            int(idx): token_str.encode("latin1") 
-            for idx, token_str in data["vocab"].items()
-        }
-        instance.vocab_inv = {
-            token_bytes: idx 
-            for idx, token_bytes in instance.vocab.items()
-        }
+    def encode(self, text: str) -> list[int]:
+        '''
+        Given input text, merge until we get something that is tokenizable
+        '''
 
-        return instance
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+        if self.special_tokens:
+            delim = "|".join(re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True))
+            chunks = re.split(f"({delim})", text)
+        else:
+            chunks = [text]
+
+
+        total_tok = []
+        for chunk in chunks:
+            if chunk == "":
+                continue
+            if chunk in self.special_tokens:
+                chunk = chunk.encode("utf-8")
+                total_tok.append(chunk)
+            else:
+                pretokens = re.findall(PAT, chunk) # chunked
+                # for each pretoken: bytes → merge → IDs
+                for pretok in pretokens:
+                    pretok = [bytes([b]) for b in pretok.encode("utf-8")]
+                    mergable = ["bro"]
+                    while mergable:
+                        mergable = []
+
+                        for i in range(len(pretok) - 1):
+                            pair = (pretok[i], pretok[i+1])
+                            if pair in self.merge_rank:
+                                mergable.append(pair)
+                        if not mergable:
+                            break
+                        merge_byte = min(mergable, key=self.merge_rank.get)
+
+                        newtok = []
+                        i = 0 # iterate over one by one to replace adjacent
+                        while i < len(pretok):
+                            if i < len(pretok) - 1 and (pretok[i], pretok[i + 1]) == merge_byte:
+                                newtok.append(pretok[i] + pretok[i + 1])
+                                i += 2
+                            else:
+                                newtok.append(pretok[i])
+                                i += 1
+                        pretok = newtok # updated with our merged pair
+                    
+                    total_tok.extend(pretok)
+        # encode all at last
+        encoded = [self.token_to_id[p] for p in total_tok]
+        return encoded
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Return a generator that yields token IDS for memory efficient tokenization of large files
+        """
+        for chunk in iterable:
+            for token_id in self.encode(chunk):
+                yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        decode from encoded vocab
+        """
+        total_bytes = []
+        for id in ids:
+            total_bytes.append(self.vocab[id])
+        decoded = b"".join(total_bytes).decode("utf-8", errors="replace")
+        return decoded
+
+if __name__ == "__main__":
+    text = "the cat ate"
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pretokenized = re.findall(PAT, text)
+    print(pretokenized)
