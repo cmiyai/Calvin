@@ -127,11 +127,17 @@ class BPETrainer:
                 old_curr_tok = curr.token
                 old_nxt_tok = nxt.token
 
-                # 1. Decrement counts of broken adjacent pairs using original tokens
+                # Decrement broken left neighbor only if it isn't the target pair being wiped out
                 if p_idx != -1:
-                    pair_freq[(nodes[p_idx].token, old_curr_tok)] -= freq
+                    old_left = (nodes[p_idx].token, old_curr_tok)
+                    if old_left != most_freq:
+                        pair_freq[old_left] -= freq
+
+                # Decrement broken right neighbor only if it isn't the target pair being wiped out
                 if n_idx != -1:
-                    pair_freq[(old_nxt_tok, nodes[n_idx].token)] -= freq
+                    old_right = (old_nxt_tok, nodes[n_idx].token)
+                    if old_right != most_freq:
+                        pair_freq[old_right] -= freq
 
                 # 2. Splice out nxt in O(1)
                 curr.token = merged
